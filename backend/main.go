@@ -7,14 +7,14 @@ import (
 	"fgo-calc-backend/internal/service"
 	"flag"
 	"log"
+	"os"
 
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	// 1. 加载配置
-	configPath := flag.String("config", "config.dev.json", "path to config file")
+	configPath := flag.String("config", "config.vercel.json", "path to config file")
 	flag.Parse()
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -22,31 +22,37 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// 2. 初始化 Repository
+	// Vercel provides the PORT environment variable.
+	if port := os.Getenv("PORT"); port != "" {
+		cfg.Port = ":" + port
+	}
+
 	repo, err := repository.NewRepository(cfg.DataDir)
 	if err != nil {
 		log.Fatalf("Failed to initialize repository: %v", err)
 	}
 	defer repo.Close()
 
-	// 3. 初始化 Service
 	svc := service.NewCalculatorService(repo)
 
-	// 4. 初始化 Handler
 	h, err := handler.NewHandler(repo, svc, cfg)
 	if err != nil {
 		log.Fatalf("Failed to initialize handler: %v", err)
 	}
 
-	// 5. 设置 Gin 路由
 	r := gin.Default()
-	r.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedExtensions([]string{
-		".png", ".gif", ".jpeg", ".jpg", ".webp",
-	})))
+
+	r.Use(gzip.Gzip(
+		gzip.DefaultCompression,
+		gzip.WithExcludedExtensions([]string{
+			".png", ".gif", ".jpeg", ".jpg", ".webp",
+		}),
+	))
+
 	h.Register(r)
 
-	// 6. 启动服务器
 	log.Printf("Server starting on %s", cfg.Port)
+
 	if err := r.Run(cfg.Port); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
