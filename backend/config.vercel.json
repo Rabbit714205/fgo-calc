@@ -1,6 +1,6 @@
 {
   "port": ":80",
-  "data_dir": "../data",
+  "data_dir": "/app/data",
   "max_cost": 130,
   "max_svt_limit": 6,
   "max_ce_limit": 6,
