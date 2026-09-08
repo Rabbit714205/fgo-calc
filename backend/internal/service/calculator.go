@@ -585,7 +585,278 @@ func (s *CalculatorService) Optimize(costLimit int, svtLimit int, ceLimit int, s
 	}
 
 	type Job struct {
-		UserCEs []model.CraftEssence
+		UserCEs    []model.CraftEssence
+		UpperBound int // -1 means unknown (no pruning)
+	}
+
+	// 上界剪枝适用于常规场景。全队活动加成提供者（party bonus）会改变
+	// “每个从者是否入队/收益多少”的枚举结构，为避免上界失效，这类请求仍走原逻辑；
+	// 普通逐从者事件加成与15绊加成已被宽松上界覆盖，可以安全剪枝。
+	fastPrune := len(partyBonusProviders) == 0
+
+	type supportExtra struct {
+		pct    float64
+		direct int
+	}
+
+	jobs := make([]Job, 0, len(userCePool))
+	if fastPrune {
+		// 从 supportPool 的组合里收集所有可能出现的助战礼装（含被锁定的）。
+		supportCandidateIDs := []int{}
+		supportSeen := map[int]bool{}
+		for _, combo := range supportPool {
+			for _, ce := range combo {
+				if !supportSeen[ce.Id] {
+					supportSeen[ce.Id] = true
+					supportCandidateIDs = append(supportCandidateIDs, ce.Id)
+				}
+			}
+		}
+		lockedSupportIDs := map[int]bool{}
+		for _, id := range includeSupportCe {
+			if supportSeen[id] {
+				lockedSupportIDs[id] = true
+			}
+		}
+		lockedSupportCount := len(lockedSupportIDs)
+		extraSupportSlots := supportLimit - lockedSupportCount
+
+		maxPartyBonus := 0
+		for _, ps := range partyBonusStates {
+			if ps.bonus > maxPartyBonus {
+				maxPartyBonus = ps.bonus
+			}
+		}
+		svtEventPct := make([]float64, len(svtPool))
+		if enableEventBonus {
+			for i := range svtPool {
+				svtEventPct[i] = float64(s.getEventBonus(&svtPool[i], serverType, selectedEvents))
+				if m := s.getEventMultiplier(&svtPool[i], serverType, selectedEvents); m > 0 {
+					svtEventPct[i] += math.Round((m - 1.0) * 100.0)
+				}
+			}
+		}
+		// 15绊结构预统计：必选/可选 provider 分开计数，便于做更紧的上界。
+		optionalFullProviders := len(bond15Providers)
+		mandatoryFullCount := 0
+		mandatoryNotFullCount := 0
+		mandatoryNormalCount := 0
+		for _, id := range includeSvt {
+			if !includeSvtSet[id] {
+				continue
+			}
+			if bond15FullSet[id] {
+				mandatoryFullCount++
+			} else if bond15NotFullSet[id] {
+				mandatoryNotFullCount++
+			} else {
+				mandatoryNormalCount++
+			}
+		}
+		mandatoryEarners := mandatoryNotFullCount + mandatoryNormalCount
+		mandatoryProviders := mandatoryFullCount + mandatoryNotFullCount
+		optionalNotFullCount := 0
+		for i := range svtPool {
+			if !includeSvtSet[svtPool[i].Id] && bond15NotFullSet[svtPool[i].Id] {
+				optionalNotFullCount++
+			}
+		}
+		remainingSlots := svtLimit - (mandatoryFullCount + mandatoryNotFullCount + mandatoryNormalCount)
+
+		supportCeEffect := func(ceId, svtId int, diffKey string) (float64, int) {
+			if ceId == TEATIME_ID {
+				return 15.0, 0
+			}
+			if m1, ok := repoCeEffects[ceId]; ok {
+				if m2, ok := m1[svtId]; ok {
+					if e, ok := m2[diffKey]; ok {
+						return e.Percent, e.Direct
+					}
+				}
+			}
+			return 0, 0
+		}
+
+		// 对每个从者形态预计算“任意助战组合”能给出的上限：
+		// 锁定礼装必须计入，其余槽位取对该从者收益最高的若干候选。
+		supportUpper := make([]map[string]supportExtra, len(svtPool))
+		for svtIdx, svt := range svtPool {
+			supportUpper[svtIdx] = make(map[string]supportExtra, len(svt.Diff))
+			for diffKey := range svt.Diff {
+				lockedPct, lockedDirect := 0.0, 0
+				extras := make([]supportExtra, 0, len(supportCandidateIDs))
+				for _, cid := range supportCandidateIDs {
+					pct, direct := supportCeEffect(cid, svt.Id, diffKey)
+					if lockedSupportIDs[cid] {
+						lockedPct += pct
+						lockedDirect += direct
+					} else {
+						extras = append(extras, supportExtra{pct: pct, direct: direct})
+					}
+				}
+				sort.Slice(extras, func(a, b int) bool {
+					va := int(float64(baseBond)*extras[a].pct/100.0) + extras[a].direct
+					vb := int(float64(baseBond)*extras[b].pct/100.0) + extras[b].direct
+					if va != vb {
+						return va > vb
+					}
+					return extras[a].pct > extras[b].pct
+				})
+				total := supportExtra{pct: lockedPct, direct: lockedDirect}
+				for n := 0; n < extraSupportSlots && n < len(extras); n++ {
+					total.pct += extras[n].pct
+					total.direct += extras[n].direct
+				}
+				supportUpper[svtIdx][diffKey] = total
+			}
+		}
+
+		upperBound := func(combo []model.CraftEssence) int {
+			ceCost := 0
+			userCeDense := make([]int, len(combo))
+			for k, ce := range combo {
+				ceCost += ce.Cost
+				userCeDense[k] = ceIdToDense[ce.Id]
+			}
+			if ceCost > costLimit {
+				return -1
+			}
+			if remainingSlots < 0 {
+				return -1
+			}
+
+			mandatoryBond := 0
+			normalVals := []int{}
+			notFullVals := []int{}
+			pushTop := func(vals []int, b, limit int) []int {
+				if limit <= 0 {
+					return vals
+				}
+				if len(vals) < limit {
+					vals = append(vals, b)
+				} else if b > vals[limit-1] {
+					vals[limit-1] = b
+				} else {
+					return vals
+				}
+				sort.Slice(vals, func(i, j int) bool { return vals[i] > vals[j] })
+				return vals
+			}
+
+			for svtIdx, svt := range svtPool {
+				if includeSvtSet[svt.Id] {
+					if bond15FullSet[svt.Id] {
+						// 已满15绊必选者自身收益为0，只计作 provider。
+						continue
+					}
+					best := -1
+					for diffKey, effSlice := range svtDiffEffects[svtIdx] {
+						pct, direct := 0.0, 0
+						for _, dense := range userCeDense {
+							e := effSlice[dense]
+							pct += e.Percent
+							direct += e.Direct
+						}
+						su := supportUpper[svtIdx][diffKey]
+						pct += su.pct
+						direct += su.direct
+						pct += svtEventPct[svtIdx]
+						pct += float64(maxPartyBonus)
+						b := int(float64(baseBond)*pct/100.0) + direct + baseBond
+						if b > best {
+							best = b
+						}
+					}
+					mandatoryBond += best
+					continue
+				}
+				if bond15FullSet[svt.Id] {
+					// 可选已满15绊从者通过 p 计数入上界，不占用普通吃羁绊名额。
+					continue
+				}
+				best := -1
+				for diffKey, effSlice := range svtDiffEffects[svtIdx] {
+					pct, direct := 0.0, 0
+					for _, dense := range userCeDense {
+						e := effSlice[dense]
+						pct += e.Percent
+						direct += e.Direct
+					}
+					su := supportUpper[svtIdx][diffKey]
+					pct += su.pct
+					direct += su.direct
+					pct += svtEventPct[svtIdx]
+					pct += float64(maxPartyBonus)
+					b := int(float64(baseBond)*pct/100.0) + direct + baseBond
+					if b > best {
+						best = b
+					}
+				}
+				if bond15NotFullSet[svt.Id] {
+					notFullVals = pushTop(notFullVals, best, min(remainingSlots, optionalNotFullCount))
+				} else {
+					normalVals = pushTop(normalVals, best, remainingSlots)
+				}
+			}
+
+			prefNormal := make([]int, len(normalVals)+1)
+			for i, b := range normalVals {
+				prefNormal[i+1] = prefNormal[i] + b
+			}
+			prefNotFull := make([]int, len(notFullVals)+1)
+			for i, b := range notFullVals {
+				prefNotFull[i+1] = prefNotFull[i] + b
+			}
+			ownSum := func(k, q int) int {
+				if q < 0 || q > len(notFullVals) || k-q < 0 || k-q > len(normalVals) {
+					return -1 << 60
+				}
+				return prefNotFull[q] + prefNormal[k-q]
+			}
+
+			bestTotal := mandatoryBond
+			maxK := remainingSlots
+			if maxK > len(normalVals)+len(notFullVals) {
+				maxK = len(normalVals) + len(notFullVals)
+			}
+			for k := 0; k <= maxK; k++ {
+				maxQ := min(min(k, optionalNotFullCount), len(notFullVals))
+				for q := 0; q <= maxQ; q++ {
+					maxP := remainingSlots - k
+					if maxP > optionalFullProviders {
+						maxP = optionalFullProviders
+					}
+					for p := 0; p <= maxP; p++ {
+						earners := mandatoryEarners + k
+						providers := mandatoryProviders + q + p
+						own := ownSum(k, q)
+						if own < 0 {
+							continue
+						}
+						bonus := 0
+						if providers > 0 && earners > 0 {
+							bonus = earners * int(float64(baseBond)*25.0*float64(providers)/100.0)
+						}
+						total := mandatoryBond + own + bonus
+						if total > bestTotal {
+							bestTotal = total
+						}
+					}
+				}
+			}
+			return bestTotal
+		}
+
+		for _, combo := range userCePool {
+			jobs = append(jobs, Job{UserCEs: combo, UpperBound: upperBound(combo)})
+		}
+		sort.SliceStable(jobs, func(a, b int) bool {
+			return jobs[a].UpperBound > jobs[b].UpperBound
+		})
+	} else {
+		for _, combo := range userCePool {
+			jobs = append(jobs, Job{UserCEs: combo, UpperBound: -1})
+		}
 	}
 
 	numWorkers := runtime.GOMAXPROCS(0)
@@ -594,6 +865,49 @@ func (s *CalculatorService) Optimize(costLimit int, svtLimit int, ceLimit int, s
 	ceJobs := make(chan []Job, numWorkers*2)
 	resultsChan := make(chan []model.Team, numWorkers*2)
 	var wg sync.WaitGroup
+
+	// 仅用于 fastPrune 路径的全局剪枝阈值：已找到的候选越多，后续低上界礼装组合
+	// 越可以被安全跳过（上界 < 当前第5名收益时，任何真实队伍都不可能挤进前5）。
+	var globalMu sync.Mutex
+	globalTeams := make([]model.Team, 0, OPTIMIZE_LIMIT)
+	globalBetter := func(a, b model.Team) bool {
+		return a.TotalBond > b.TotalBond ||
+			(a.TotalBond == b.TotalBond && a.TotalCost > b.TotalCost)
+	}
+	recordTeam := func(team model.Team) {
+		globalMu.Lock()
+		defer globalMu.Unlock()
+		if len(globalTeams) < OPTIMIZE_LIMIT {
+			globalTeams = append(globalTeams, team)
+			return
+		}
+		worst := 0
+		for i := 1; i < len(globalTeams); i++ {
+			if globalBetter(globalTeams[worst], globalTeams[i]) {
+				worst = i
+			}
+		}
+		if globalBetter(team, globalTeams[worst]) {
+			globalTeams[worst] = team
+		}
+	}
+	skipByUpperBound := func(ub int) bool {
+		if ub < 0 {
+			return false
+		}
+		globalMu.Lock()
+		defer globalMu.Unlock()
+		if len(globalTeams) < OPTIMIZE_LIMIT {
+			return false
+		}
+		worst := 0
+		for i := 1; i < len(globalTeams); i++ {
+			if globalBetter(globalTeams[worst], globalTeams[i]) {
+				worst = i
+			}
+		}
+		return ub < globalTeams[worst].TotalBond
+	}
 
 	worker := func() {
 		defer wg.Done()
@@ -688,6 +1002,9 @@ func (s *CalculatorService) Optimize(costLimit int, svtLimit int, ceLimit int, s
 			localTeams := make([]model.Team, 0, OPTIMIZE_LIMIT)
 
 			for _, job := range batch {
+				if fastPrune && skipByUpperBound(job.UpperBound) {
+					continue
+				}
 				ceCombo := job.UserCEs
 
 				ceCost := 0
@@ -1118,6 +1435,11 @@ func (s *CalculatorService) Optimize(costLimit int, svtLimit int, ceLimit int, s
 			} // end batch loop
 
 			if len(localTeams) > 0 {
+				if fastPrune {
+					for _, team := range localTeams {
+						recordTeam(team)
+					}
+				}
 				resultsChan <- localTeams
 			}
 		}
@@ -1134,8 +1456,8 @@ func (s *CalculatorService) Optimize(costLimit int, svtLimit int, ceLimit int, s
 			batchSize = 1
 		}
 		batch := make([]Job, 0, batchSize)
-		for _, userCEs := range userCePool {
-			batch = append(batch, Job{UserCEs: userCEs})
+		for _, job := range jobs {
+			batch = append(batch, job)
 			if len(batch) >= batchSize {
 				ceJobs <- batch
 				batch = make([]Job, 0, batchSize)
