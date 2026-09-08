@@ -1,0 +1,28 @@
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /src/backend
+
+COPY backend/go.mod backend/go.sum ./
+
+RUN go mod download
+
+COPY backend/ ./
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -o /fgo-calc-backend .
+
+FROM alpine:3.22
+
+WORKDIR /app
+
+COPY --from=builder /fgo-calc-backend /app/fgo-calc-backend
+
+COPY backend/static /app/static
+COPY backend/config.vercel.json /app/config.vercel.json
+COPY data /app/data
+
+ENV GIN_MODE=release
+
+EXPOSE 80
+
+CMD ["/app/fgo-calc-backend", "-config", "/app/config.vercel.json"]
