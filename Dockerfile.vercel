@@ -16,7 +16,6 @@ FROM alpine:3.22
 WORKDIR /app
 
 COPY --from=builder /fgo-calc-backend /app/fgo-calc-backend
-
 COPY backend/static /app/static
 COPY backend/config.vercel.json /app/config.vercel.json
 COPY data /app/data
